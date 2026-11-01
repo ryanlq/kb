@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# kb — 个人知识库快速记录 CLI（纯 curl，零依赖，多端可用）
+# 依赖：bash + curl + coreutils；环境变量 SURREAL_AGENT_PASS
+# 用法见 ~/.agents/skills/kb/SKILL.md 或 kb help
+set -euo pipefail
+
+EP="${KB_ENDPOINT:-https://brave-nebula-06gpcti7s5os3cci5aqjbp4f68.aws-use1.surreal.cloud}"
+NS="${KB_NS:-private}"; DB="${KB_DB:-main}"
+: "${SURREAL_AGENT_PASS:?需要环境变量 SURREAL_AGENT_PASS（agent 账户密码）}"
+
+# ---------- JWT 缓存（1h 有效，55 分钟复用） ----------
+CACHE_DIR="${TMPDIR:-/tmp}/kb-cache"; mkdir -p "$CACHE_DIR"
+CACHE="$CACHE_DIR/jwt_${NS}_${DB}"
+
+get_jwt() {
+  local now=$(date +%s)
+  if [ -s "$CACHE.at" ] && [ -s "$CACHE" ]; then
+    local at; at=$(cat "$CACHE.at")
+    if [ $((now - at)) -lt 3300 ]; then cat "$CACHE"; return; fi
+  fi
+  local r
+  r=$(curl -sS -m 20 -X POST "https://${EP#https://}/rpc" \
+    -H 'Content-Type: application/json' \
+    -d "{\"id\":1,\"method\":\"signin\",\"params\":[{\"ns\":\"$NS\",\"db\":\"$DB\",\"user\":\"agent\",\"pass\":\"$SURREAL_AGENT_PASS\"}]}")
+  local jwt; jwt=$(printf '%s' "$r" | grep -oE '"result":"[^"]+"' | cut -d'"' -f4)
+  [ -n "$jwt" ] || { echo "kb: 登录失败 $r" >&2; exit 1; }
+  printf '%s' "$jwt" > "$CACHE"; echo "$now" > "$CACHE.at"
+  printf '%s' "$jwt"
+}
+
+# 值 → SurrealQL 单引号字符串字面量（封装换行/引号/反斜杠三个坑）
+sqlstr() {
+  local s="$1"
+  s=${s//\\/\\\\}      # 反斜杠
+  s=${s//$'\n'/\\n}    # 真实换行 → \n 转义
+  s=${s//$'\r'/}       # 回车丢弃
+  s=${s//\'/\\\'}      # 单引号
+  printf "'%s'" "$s"
+}
+
+run_sql() {  # stdin: SQL
+  local jwt; jwt=$(get_jwt)
+  curl -sS -m 30 -X POST "https://${EP#https://}/sql" \
+    -H 'Accept: application/json' \
+    -H "surreal-ns: $NS" -H "surreal-db: $DB" \
+    -H "Authorization: Bearer $jwt" \
+    --data-binary @-
+}
+
+# 标题 → 可读 record id（下划线，不用连字符！）
+slug() {
+  local s; s=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '_' | sed 's/^_*//; s/_*$//; s/__*/_/g')
+  printf '%s' "${s:-entry}_$(date +%m%d)"
+}
+
+# 日期参数 → ISO；支持 YYYY-MM-DD / +Nd / +Nw
+to_iso() {
+  local d="$1"
+  if [[ "$d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then printf '%sT00:00:00Z' "$d"; return; fi
+  if [[ "$d" =~ ^\+([0-9]+)d$ ]]; then date -u -d "+${BASH_REMATCH[1]} days" +%Y-%m-%dT00:00:00Z; return; fi
+  if [[ "$d" =~ ^\+([0-9]+)w$ ]]; then date -u -d "+$((BASH_REMATCH[1]*7)) days" +%Y-%m-%dT00:00:00Z; return; fi
+  echo "kb: 日期格式应为 YYYY-MM-DD 或 +Nd/+Nw" >&2; exit 1
+}
+
+usage() { cat <<'U'
+kb — 个人知识库记录 CLI（数据在 SurrealDB Cloud，private/public 双区）
+
+  kb plan "标题" [--status not_started|in_progress|done] [--priority low|medium|high|urgent]
+           [--deadline YYYY-MM-DD|+Nd] [--project 项目id] [--desc 说明] [--tags a,b]
+  kb project "名称" [--status planned|active|paused|done|archived] [--desc 说明] [--target +Nd]
+  kb milestone <项目id> "里程碑名" [--due +Nd] [--status pending|in_progress|done|blocked]
+  kb progress <项目id> "一句话进展" [--pct 0-100] [--detail 细节]
+  kb lesson "标题" "可复用结论" [--tags a,b] [--source 来源] [--content 详细复盘] [--project 项目id]
+  kb note "内容" [--title 标题] [--pin]
+  kb article "标题" <slug> "Markdown 正文" [--summary 摘要] [--tags a,b]   # 建草稿（public 区）
+  kb publish <slug>          # 发布文章（需用户确认后执行；public 区）
+  kb set <表> <id> <字段>=<值>...        # 通用更新（如 kb set plan xxx status=done）
+  kb list <plan|project|milestone|progress_entry|lesson|note|article> [-n 10]
+  kb sql "任意 SurrealQL"     # 兜底（默认 private 区；public 加 KB_NS=public）
+
+环境变量：SURREAL_AGENT_PASS（必需）KB_NS（默认 private）KB_DB（默认 main）
+U
+}
+
+# ---------- 参数解析 ----------
+CMD="${1:-help}"; shift || true
+declare -A O=([status]='' [priority]='' [deadline]='' [project]='' [desc]='' [tags]=''
+  [due]='' [pct]='' [detail]='' [title]='' [source]='' [content]='' [summary]='' [pin]='' [target]='')
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --*) k="${1#--}"; [ -n "${O[$k]+x}" ] || { echo "kb: 未知选项 $1" >&2; exit 1; }; O[$k]="$2"; shift 2 ;;
+    *) POS+=("$1"); shift ;;
+  esac
+done
+
+now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+q() { printf '%s;\n' "$1"; }   # 组装并执行在调用处
+
+case "$CMD" in
+  plan)
+    [ ${#POS[@]} -ge 1 ] || { echo "kb plan 需要标题" >&2; exit 1; }
+    id=$(slug "${POS[0]}")
+    s="CREATE plan:$id SET name = $(sqlstr "${POS[0]}"), status = '${O[status]:-not_started}', priority = '${O[priority]:-medium}'"
+    [ -n "${O[deadline]}" ] && s="$s, deadline = d\"$(to_iso "${O[deadline]}")\""
+    [ -n "${O[project]}" ] && s="$s, project = project:${O[project]}"
+    [ -n "${O[desc]}" ]    && s="$s, description = $(sqlstr "${O[desc]}")"
+    [ -n "${O[tags]}" ]    && s="$s, tags = [$(echo "${O[tags]}" | tr ',' '\n' | sed 's/^/"/; s/$/"/' | paste -sd,)]"
+    q "$s" | run_sql | grep -q '"status":"OK"' && echo "✓ plan:$id" ;;
+  project)
+    [ ${#POS[@]} -ge 1 ] || { echo "kb project 需要名称" >&2; exit 1; }
+    id=$(slug "${POS[0]}")
+    s="CREATE project:$id SET name = $(sqlstr "${POS[0]}"), status = '${O[status]:-active}'"
+    [ -n "${O[desc]}" ]   && s="$s, description = $(sqlstr "${O[desc]}")"
+    [ -n "${O[target]}" ] && s="$s, target_at = d\"$(to_iso "${O[target]}")\""
+    q "$s" | run_sql | grep -q '"status":"OK"' && echo "✓ project:$id" ;;
+  milestone)
+    [ ${#POS[@]} -ge 2 ] || { echo "kb milestone 需要 项目id 里程碑名" >&2; exit 1; }
+    id=$(slug "${POS[1]}")
+    s="CREATE milestone:$id SET name = $(sqlstr "${POS[1]}"), project = project:${POS[0]}, status = '${O[status]:-pending}'"
+    [ -n "${O[due]}" ] && s="$s, due = d\"$(to_iso "${O[due]}")\""
+    q "$s" | run_sql | grep -q '"status":"OK"' && echo "✓ milestone:$id" ;;
+  progress)
+    [ ${#POS[@]} -ge 2 ] || { echo "kb progress 需要 项目id 进展摘要" >&2; exit 1; }
+    id="p$(date +%Y%m%d_%H%M%S)"
+    s="CREATE progress_entry:$id SET project = project:${POS[0]}, summary = $(sqlstr "${POS[1]}")"
+    [ -n "${O[pct]}" ]    && s="$s, pct = ${O[pct]}"
+    [ -n "${O[detail]}" ] && s="$s, detail = $(sqlstr "${O[detail]}")"
+    q "$s" | run_sql | grep -q '"status":"OK"' && echo "✓ progress_entry:$id" ;;
+  lesson)
+    [ ${#POS[@]} -ge 2 ] || { echo "kb lesson 需要 标题 可复用结论" >&2; exit 1; }
+    id=$(slug "${POS[0]}")
+    s="CREATE lesson:$id SET title = $(sqlstr "${POS[0]}"), takeaway = $(sqlstr "${POS[1]}"), source = '${O[source]:-agent 实践}'"
+    [ -n "${O[content]}" ] && s="$s, content = $(sqlstr "${O[content]}")"
+    [ -n "${O[project]}" ] && s="$s, project = project:${O[project]}"
+    [ -n "${O[tags]}" ]    && s="$s, tags = [$(echo "${O[tags]}" | tr ',' '\n' | sed 's/^/"/; s/$/"/' | paste -sd,)]"
+    q "$s" | run_sql | grep -q '"status":"OK"' && echo "✓ lesson:$id" ;;
+  note)
+    [ ${#POS[@]} -ge 1 ] || { echo "kb note 需要内容" >&2; exit 1; }
+    id=$(slug "${O[title]:-${POS[0]}}")
+    s="CREATE note:$id SET content = $(sqlstr "${POS[0]}")"
+    [ -n "${O[title]}" ] && s="$s, title = $(sqlstr "${O[title]}")"
+    [ "${O[pin]}" = "true" ] || [ "${O[pin]}" = "1" ] && s="$s, pinned = true"
+    q "$s" | run_sql | grep -q '"status":"OK"' && echo "✓ note:$id" ;;
+  article)
+    [ ${#POS[@]} -ge 3 ] || { echo "kb article 需要 标题 slug 正文" >&2; exit 1; }
+    NS=public DB=main CACHE="$CACHE_DIR/jwt_public_main"
+    s="CREATE article:$(slug "${POS[0]}") SET title = $(sqlstr "${POS[0]}"), slug = '${POS[1]}', content = $(sqlstr "${POS[2]}"), status = 'draft'"
+    [ -n "${O[summary]}" ] && s="$s, summary = $(sqlstr "${O[summary]}")"
+    [ -n "${O[tags]}" ]    && s="$s, tags = [$(echo "${O[tags]}" | tr ',' '\n' | sed 's/^/"/; s/$/"/' | paste -sd,)]"
+    q "$s" | run_sql | grep -q '"status":"OK"' && echo "✓ article 草稿（slug=${POS[1]}，发布用 kb publish ${POS[1]}）" ;;
+  publish)
+    [ ${#POS[@]} -ge 1 ] || { echo "kb publish 需要 slug" >&2; exit 1; }
+    NS=public DB=main CACHE="$CACHE_DIR/jwt_public_main"
+    q "UPDATE article SET status = 'published', published_at = time::now() WHERE slug = '${POS[0]}' AND status = 'draft'" | run_sql | grep -q '"status":"OK"' && echo "✓ 已发布（记得 cd kb-web && bun run deploy 更新静态站）" ;;
+  set)
+    [ ${#POS[@]} -ge 3 ] || { echo "kb set 需要 表 id 字段=值..." >&2; exit 1; }
+    t=${POS[0]}; rid=${POS[1]}; shift 2; SETS=""
+    for kv in "${POS[@]:2}"; do
+      k=${kv%%=*}; v=${kv#*=}
+      case "$v" in true|false|[0-9]*) SETS="$SETS, $k = $v" ;; *) SETS="$SETS, $k = $(sqlstr "$v")" ;; esac
+    done
+    q "UPDATE $t:$rid SET ${SETS#, }" | run_sql | grep -q '"status":"OK"' && echo "✓ $t:$rid 已更新" ;;
+  list)
+    t=${POS[0]:-plan}; n=10
+    for a in "${POS[@]:1}"; do [ "$a" = "${a#-n}" ] || n=${a#-n}; done
+    case "$t" in
+      plan|project|milestone|lesson|note|article) ;;
+      progress_entry|progress) t=progress_entry ;;
+      *) echo "kb: 未知表 $t" >&2; exit 1 ;;
+    esac
+    [ "$t" = article ] && { NS=public; DB=main; CACHE="$CACHE_DIR/jwt_public_main"; }
+    q "SELECT * FROM $t ORDER BY id DESC LIMIT $n" | run_sql | grep -oE '"id":"[^"]*"|"name":"[^"]*"|"title":"[^"]*"|"status":"[^"]*"|"summary":"[^"]{0,60}' | head -60 ;;
+  sql)
+    [ ${#POS[@]} -ge 1 ] || { echo "kb sql 需要语句" >&2; exit 1; }
+    q "${POS[0]}" | run_sql ;;
+  help|-h|--help|*) usage ;;
+esac
