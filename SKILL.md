@@ -34,7 +34,7 @@ $KB plan "修复登录超时" --priority high --deadline +3d
 $KB progress surreal_kb_setup "仪表盘上线" --pct 100
 $KB lesson "curl 发中文会 GBK 乱码" "用 --data-binary @- 从 stdin 传" --tags curl,编码
 $KB note "域名备忘：serenityhub.top 还空着" --pin true
-$KB list lesson -n 5             # 查最近记录
+$KB list lesson -n5             # 查最近记录
 $KB sql "SELECT * FROM plan WHERE status = 'in_progress'"   # 兜底查询
 ```
 

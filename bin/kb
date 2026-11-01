@@ -75,7 +75,7 @@ kb — 个人知识库记录 CLI（数据在 SurrealDB Cloud，private/public �
   kb article "标题" <slug> "Markdown 正文" [--summary 摘要] [--tags a,b]   # 建草稿（public 区）
   kb publish <slug>          # 发布文章（需用户确认后执行；public 区）
   kb set <表> <id> <字段>=<值>...        # 通用更新（如 kb set plan xxx status=done）
-  kb list <plan|project|milestone|progress_entry|lesson|note|article> [-n 10]
+  kb list <plan|project|milestone|progress_entry|lesson|note|article> [-n5]
   kb sql "任意 SurrealQL"     # 兜底（默认 private 区；public 加 KB_NS=public）
 
 环境变量：SURREAL_AGENT_PASS（必需）KB_NS（默认 private）KB_DB（默认 main）
@@ -162,7 +162,7 @@ case "$CMD" in
     q "UPDATE $t:$rid SET ${SETS#, }" | run_sql | grep -q '"status":"OK"' && echo "✓ $t:$rid 已更新" ;;
   list)
     t=${POS[0]:-plan}; n=10
-    for a in "${POS[@]:1}"; do [ "$a" = "${a#-n}" ] || n=${a#-n}; done
+    for a in "${POS[@]:1}"; do case "$a" in -n[0-9]*) n=${a#-n} ;; esac; done
     case "$t" in
       plan|project|milestone|lesson|note|article) ;;
       progress_entry|progress) t=progress_entry ;;
