@@ -50,7 +50,7 @@ run_sql() {  # stdin: SQL
 # 标题 → 可读 record id（下划线，不用连字符！）
 slug() {
   local s; s=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '_' | sed 's/^_*//; s/_*$//; s/__*/_/g')
-  printf '%s' "${s:-entry}_$(date +%m%d)"
+  if [ -z "$s" ]; then printf 'kb_%s' "$(date +%Y%m%d_%H%M%S)"; else printf '%s_%s' "$s" "$(date +%m%d)"; fi
 }
 
 # 日期参数 → ISO；支持 YYYY-MM-DD / +Nd / +Nw
