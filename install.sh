@@ -18,10 +18,14 @@ echo "==> 安装 kb skill 到 $DEST"
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 
 fetch() {
+  if [ -n "${KB_LOCAL:-}" ]; then
+    echo "    (KB_LOCAL 本地模式：从 $KB_LOCAL 复制，供无 GitHub 访问的机器）"
+    mkdir -p "$TMP/kb"; cp -r "$KB_LOCAL"/. "$TMP/kb/"; return
+  fi
   if command -v git >/dev/null 2>&1; then
     git clone --depth 1 "$REPO" "$TMP/kb" 2>/dev/null && return
   fi
-  echo "    (git 不可用或失败，改用 tarball)"
+  echo "    (git 不可用或失败，改用 tarball）"
   curl -fsSL "$RAW/tarball/main" -o "$TMP/kb.tgz"
   mkdir -p "$TMP/kb"; tar -xzf "$TMP/kb.tgz" -C "$TMP/kb" --strip-components=1
 }
@@ -53,8 +57,10 @@ done
 if [ -n "$PASS" ]; then
   RC="$HOME/.bashrc"; [ -f "$HOME/.zshrc" ] && [ ! -f "$HOME/.bashrc" ] && RC="$HOME/.zshrc"
   grep -q "SURREAL_AGENT_PASS" "$RC" 2>/dev/null || printf '\nexport SURREAL_AGENT_PASS="%s"\n' "$PASS" >> "$RC"
+  # 密钥文件：非交互 SSH / cron 也能用（.bashrc 不一定被加载）
+  printf '%s' "$PASS" > "$HOME/.kb_pass" && chmod 600 "$HOME/.kb_pass"
   export SURREAL_AGENT_PASS="$PASS"
-  echo "==> SURREAL_AGENT_PASS 已写入 $RC"
+  echo "==> SURREAL_AGENT_PASS 已写入 $RC + $HOME/.kb_pass"
 fi
 
 echo "==> 验证连接"

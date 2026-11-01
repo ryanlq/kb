@@ -6,7 +6,9 @@ set -euo pipefail
 
 EP="${KB_ENDPOINT:-https://brave-nebula-06gpcti7s5os3cci5aqjbp4f68.aws-use1.surreal.cloud}"
 NS="${KB_NS:-private}"; DB="${KB_DB:-main}"
-: "${SURREAL_AGENT_PASS:?需要环境变量 SURREAL_AGENT_PASS（agent 账户密码）}"
+# 密码：环境变量优先，回退 ~/.kb_pass 文件（非交互 SSH 下 .bashrc 不加载也能用）
+SURREAL_AGENT_PASS="${SURREAL_AGENT_PASS:-$(cat "$HOME/.kb_pass" 2>/dev/null)}"
+: "${SURREAL_AGENT_PASS:?需要 SURREAL_AGENT_PASS 环境变量或 ~/.kb_pass 文件（agent 账户密码）}"
 
 # ---------- JWT 缓存（1h 有效，55 分钟复用） ----------
 CACHE_DIR="${TMPDIR:-/tmp}/kb-cache"; mkdir -p "$CACHE_DIR"
